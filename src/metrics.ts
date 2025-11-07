@@ -1,71 +1,128 @@
-import Redis from "ioredis";
 import dotenv from "dotenv";
 import { SMSPayload, CallPayload } from "./types";
 dotenv.config();
 
-const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 const MAX_LAST = parseInt(process.env.MAX_LAST_EVENTS || "100", 10);
-const redis = new Redis(REDIS_URL);
 
-const smsAggKey = (clientId: string) => `metrics:${clientId}:sms`;
-const callAggKey = (clientId: string) => `metrics:${clientId}:call`;
-const smsListKey = (clientId: string) => `events:${clientId}:sms`;
-const callListKey = (clientId: string) => `events:${clientId}:call`;
+interface SMSMetrics {
+  total: number;
+  delivered: number;
+  failed: number;
+  sent: number;
+  lastUpdated: string | null;
+}
+
+interface CallMetrics {
+  total: number;
+  ringing: number;
+  connected: number;
+  ended: number;
+  failed: number;
+  totalDuration: number;
+  lastUpdated: string | null;
+}
+
+const smsEvents: Map<string, SMSPayload[]> = new Map();
+const callEvents: Map<string, CallPayload[]> = new Map();
+const smsMetrics: Map<string, SMSMetrics> = new Map();
+const callMetrics: Map<string, CallMetrics> = new Map();
+
+function getOrInitSMSMetrics(clientId: string): SMSMetrics {
+  if (!smsMetrics.has(clientId)) {
+    smsMetrics.set(clientId, {
+      total: 0,
+      delivered: 0,
+      failed: 0,
+      sent: 0,
+      lastUpdated: null,
+    });
+  }
+  return smsMetrics.get(clientId)!;
+}
+
+function getOrInitCallMetrics(clientId: string): CallMetrics {
+  if (!callMetrics.has(clientId)) {
+    callMetrics.set(clientId, {
+      total: 0,
+      ringing: 0,
+      connected: 0,
+      ended: 0,
+      failed: 0,
+      totalDuration: 0,
+      lastUpdated: null,
+    });
+  }
+  return callMetrics.get(clientId)!;
+}
 
 export async function recordSMS(event: SMSPayload) {
-  const listKey = smsListKey(event.clientId);
-  const aggKey = smsAggKey(event.clientId);
-
   try {
-    await redis.lpush(listKey, JSON.stringify(event));
-    await redis.ltrim(listKey, 0, MAX_LAST - 1);
+    if (!smsEvents.has(event.clientId)) {
+      smsEvents.set(event.clientId, []);
+    }
+    const events = smsEvents.get(event.clientId)!;
+    events.unshift(event);
+    if (events.length > MAX_LAST) {
+      events.splice(MAX_LAST);
+    }
 
-    await redis.hincrby(aggKey, "total", 1);
-    await redis.hincrby(aggKey, event.status, 1);
-    await redis.hset(aggKey, "lastUpdated", new Date().toISOString());
+    const metrics = getOrInitSMSMetrics(event.clientId);
+    metrics.total += 1;
+    if (event.status === "delivered") metrics.delivered += 1;
+    else if (event.status === "failed") metrics.failed += 1;
+    else if (event.status === "sent") metrics.sent += 1;
+    metrics.lastUpdated = new Date().toISOString();
   } catch (err) {
-    console.error("Error recording SMS event in Redis", { event, error: err });
+    console.error("Error recording SMS event", { event, error: err });
     throw err;
   }
 }
 
 export async function recordCall(event: CallPayload) {
-  const listKey = callListKey(event.clientId);
-  const aggKey = callAggKey(event.clientId);
-
   try {
-    await redis.lpush(listKey, JSON.stringify(event));
-    await redis.ltrim(listKey, 0, MAX_LAST - 1);
-
-    await redis.hincrby(aggKey, "total", 1);
-    await redis.hincrby(aggKey, event.status, 1);
-    if (event.duration && typeof event.duration === "number") {
-      await redis.hincrby(aggKey, "totalDuration", event.duration);
+    if (!callEvents.has(event.clientId)) {
+      callEvents.set(event.clientId, []);
     }
-    await redis.hset(aggKey, "lastUpdated", new Date().toISOString());
+    const events = callEvents.get(event.clientId)!;
+    events.unshift(event);
+    if (events.length > MAX_LAST) {
+      events.splice(MAX_LAST);
+    }
+
+    const metrics = getOrInitCallMetrics(event.clientId);
+    metrics.total += 1;
+    if (event.status === "ringing") metrics.ringing += 1;
+    else if (event.status === "connected") metrics.connected += 1;
+    else if (event.status === "ended") metrics.ended += 1;
+    else if (event.status === "failed") metrics.failed += 1;
+    
+    if (event.duration && typeof event.duration === "number") {
+      metrics.totalDuration += event.duration;
+    }
+    metrics.lastUpdated = new Date().toISOString();
   } catch (err) {
-    console.error("Error recording call event in Redis", { event, error: err });
+    console.error("Error recording call event", { event, error: err });
     throw err;
   }
 }
 
 export async function getMetrics(clientId: string) {
   try {
-    const sms = await redis.hgetall(smsAggKey(clientId));
-    const calls = await redis.hgetall(callAggKey(clientId));
+    const sms = smsMetrics.get(clientId) || getOrInitSMSMetrics(clientId);
+    const calls = callMetrics.get(clientId) || getOrInitCallMetrics(clientId);
 
-    const smsTotal = Number(sms.total || 0);
-    const delivered = Number(sms.delivered || 0);
-    const failed = Number(sms.failed || 0);
-    const sent = Number(sms.sent || 0);
+    const smsTotal = sms.total;
+    const delivered = sms.delivered;
+    const failed = sms.failed;
+    const sent = sms.sent;
     const smsSuccessRate = smsTotal > 0 ? (delivered / smsTotal) * 100 : 0;
 
-    const callsTotal = Number(calls.total || 0);
-    const ringing = Number(calls.ringing || 0);
-    const connected = Number(calls.connected || 0);
-    const ended = Number(calls.ended || 0);
-    const callFailed = Number(calls.failed || 0);
-    const totalDuration = Number(calls.totalDuration || 0);
+    const callsTotal = calls.total;
+    const ringing = calls.ringing;
+    const connected = calls.connected;
+    const ended = calls.ended;
+    const callFailed = calls.failed;
+    const totalDuration = calls.totalDuration;
     const avgDuration = ended > 0 ? totalDuration / ended : 0;
 
     const activeCalls = Math.max(0, connected - ended);
@@ -92,22 +149,21 @@ export async function getMetrics(clientId: string) {
       lastUpdated: sms.lastUpdated || calls.lastUpdated || null,
     };
   } catch (err) {
-    console.error("Error fetching metrics from Redis", { clientId, error: err });
+    console.error("Error fetching metrics", { clientId, error: err });
     throw err;
   }
 }
 
-
 export async function getLastEvents(clientId: string) {
   try {
-    const sms = await redis.lrange(smsListKey(clientId), 0, -1);
-    const calls = await redis.lrange(callListKey(clientId), 0, -1);
+    const sms = smsEvents.get(clientId) || [];
+    const calls = callEvents.get(clientId) || [];
     return {
-      sms: sms.map(s => JSON.parse(s)),
-      calls: calls.map(c => JSON.parse(c))
+      sms,
+      calls,
     };
   } catch (err) {
-    console.error("Error fetching last events from Redis", { clientId, error: err });
+    console.error("Error fetching last events", { clientId, error: err });
     throw err;
   }
 }

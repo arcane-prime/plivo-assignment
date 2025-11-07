@@ -6,14 +6,6 @@ services:
     ports:
       - "4000:4000"
     environment:
-      - REDIS_URL=redis://redis:6379
       - PORT=4000
       - MAX_LAST_EVENTS=100
       - WS_HEARTBEAT_MS=30000
-    depends_on:
-      - redis
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
