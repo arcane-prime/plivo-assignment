@@ -15,6 +15,14 @@ The service uses in-memory storage (no external databases required) and includes
 - Backpressure handling for slow clients
 - Automatic cleanup of subscriptions when clients disconnect
 
+## Backpressure Policy
+
+The service implements automatic backpressure handling to prevent memory overflow when clients are slow to consume messages. Messages are automatically dropped if:
+- The WebSocket buffer exceeds 1MB (configurable via `MAX_WS_BUFFER_SIZE` environment variable)
+- More than 100 messages are pending (configurable via `MAX_PENDING_MESSAGES` environment variable)
+
+This ensures that slow clients don't cause the server to consume excessive memory, while fast clients continue to receive messages normally.
+
 ## Getting Started
 
 ### Prerequisites

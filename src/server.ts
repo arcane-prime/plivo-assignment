@@ -63,7 +63,7 @@ export async function createApp() {
 
   app.get("/ping", (_req, res) => res.send("pong"));
 
-  app.get("api/health", (_req, res) => {
+  app.get("/api/health", (_req, res) => {
     const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
     const topicsCount = getAllTopics().length;
     const subscribersCount = getTotalSubscriberCount();
