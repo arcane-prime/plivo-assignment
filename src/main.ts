@@ -4,6 +4,8 @@ import dotenv from "dotenv";
 import { createApp } from "./server";
 import { pubsub } from "./pubsub";
 import { getLastEvents } from "./metrics";
+import { topicExists } from "./topics";
+import { setWebSocketServer, registerSubscription, unregisterSubscription } from "./subscribers";
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 4000);
@@ -18,6 +20,8 @@ async function start() {
   const app = await createApp();
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: "/ws" });
+  
+  setWebSocketServer(wss);
 
   wss.on("connection", (rawWs) => {
     const ws = rawWs as WsExt;
@@ -36,6 +40,18 @@ async function start() {
 
         if (type === "subscribe") {
           if (!client_id) return;
+          if (!topicExists(topic)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "error",
+                topic,
+                client_id,
+                request_id,
+                error: "TOPIC_NOT_FOUND"
+              }));
+            }
+            return;
+          }
           const subscriptionKey = `${topic}:${client_id}`;
           if (ws.unsubscribers!.has(subscriptionKey)) return;
 
@@ -52,6 +68,7 @@ async function start() {
           };
           const unsubscribe = await pubsub.subscribe(topic, handler);
           ws.unsubscribers!.set(subscriptionKey, unsubscribe);
+          registerSubscription(topic, subscriptionKey);
 
           if (last_n && last_n > 0 && client_id) {
             try {
@@ -78,11 +95,24 @@ async function start() {
           }
         } else if (type === "unsubscribe") {
           if (!client_id) return;
+          if (!topicExists(topic)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "error",
+                topic,
+                client_id,
+                request_id,
+                error: "TOPIC_NOT_FOUND"
+              }));
+            }
+            return;
+          }
           const subscriptionKey = `${topic}:${client_id}`;
           const unsub = ws.unsubscribers!.get(subscriptionKey);
           if (unsub) {
             await unsub();
             ws.unsubscribers!.delete(subscriptionKey);
+            unregisterSubscription(topic, subscriptionKey);
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({
                 type: "unsubscribed",
@@ -100,6 +130,17 @@ async function start() {
                 topic,
                 request_id,
                 error: "Missing message field"
+              }));
+            }
+            return;
+          }
+          if (!topicExists(topic)) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "error",
+                topic,
+                request_id,
+                error: "TOPIC_NOT_FOUND"
               }));
             }
             return;
@@ -131,9 +172,11 @@ async function start() {
     });
 
     ws.on("close", async () => {
-      for (const [, unsub] of ws.unsubscribers!) {
+      for (const [key, unsub] of ws.unsubscribers!) {
         try {
           await unsub();
+          const [topic] = key.split(":");
+          unregisterSubscription(topic, key);
         } catch (err) {
           console.error("Error unsubscribing on WebSocket close", err);
         }
