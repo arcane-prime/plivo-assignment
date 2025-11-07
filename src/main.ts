@@ -31,43 +31,98 @@ async function start() {
     ws.on("message", async (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
-        // expected shape: { action: 'subscribe'|'unsubscribe', topic: 'client:client_A:sms', sendLast: true }
-        const { action, topic, sendLast } = msg;
-        if (!action || !topic) return;
+        const { type, topic, client_id, last_n, request_id, message } = msg;
+        if (!type || !topic) return;
 
-        if (action === "subscribe") {
-          if (ws.unsubscribers!.has(topic)) return; // already subscribed
-          // handler sends messages to this ws
+        if (type === "subscribe") {
+          if (!client_id) return;
+          const subscriptionKey = `${topic}:${client_id}`;
+          if (ws.unsubscribers!.has(subscriptionKey)) return;
+
           const handler = (payload: any) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ topic, payload }));
+              ws.send(JSON.stringify({ 
+                type: "message",
+                topic,
+                client_id,
+                request_id,
+                payload 
+              }));
             }
           };
           const unsubscribe = await pubsub.subscribe(topic, handler);
-          ws.unsubscribers!.set(topic, unsubscribe);
+          ws.unsubscribers!.set(subscriptionKey, unsubscribe);
 
-          // optionally send last events for that client/topic
-          if (sendLast) {
-            const parts = topic.split(":"); // client:{id}:sms
-            if (parts.length === 3) {
-              const clientId = parts[1];
-              const type = parts[2]; // sms|call
-              try {
-                const last = await getLastEvents(clientId);
-                const events = type === "sms" ? last.sms : last.calls;
-                if (ws.readyState === WebSocket.OPEN) {
-                  ws.send(JSON.stringify({ topic, past: events }));
-                }
-              } catch (err) {
-                console.error("Error fetching last events for WebSocket", err);
+          if (last_n && last_n > 0 && client_id) {
+            try {
+              const last = await getLastEvents(client_id);
+              const allEvents = [...(last.sms || []), ...(last.calls || [])];
+              const sortedEvents = allEvents.sort((a, b) => {
+                const timeA = new Date(a.timestamp).getTime();
+                const timeB = new Date(b.timestamp).getTime();
+                return timeB - timeA;
+              });
+              const lastNEvents = sortedEvents.slice(0, last_n);
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ 
+                  type: "last_n",
+                  topic,
+                  client_id,
+                  request_id,
+                  events: lastNEvents 
+                }));
               }
+            } catch (err) {
+              console.error("Error fetching last events for WebSocket", err);
             }
           }
-        } else if (action === "unsubscribe") {
-          const unsub = ws.unsubscribers!.get(topic);
+        } else if (type === "unsubscribe") {
+          if (!client_id) return;
+          const subscriptionKey = `${topic}:${client_id}`;
+          const unsub = ws.unsubscribers!.get(subscriptionKey);
           if (unsub) {
             await unsub();
-            ws.unsubscribers!.delete(topic);
+            ws.unsubscribers!.delete(subscriptionKey);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "unsubscribed",
+                topic,
+                client_id,
+                request_id
+              }));
+            }
+          }
+        } else if (type === "publish") {
+          if (!message) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "error",
+                topic,
+                request_id,
+                error: "Missing message field"
+              }));
+            }
+            return;
+          }
+          try {
+            await pubsub.publish(topic, message);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "published",
+                topic,
+                request_id
+              }));
+            }
+          } catch (err) {
+            console.error("Error publishing message", err);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "error",
+                topic,
+                request_id,
+                error: "Failed to publish message"
+              }));
+            }
           }
         }
       } catch (err) {
