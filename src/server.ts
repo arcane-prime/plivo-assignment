@@ -61,6 +61,7 @@ export async function createApp() {
     }
   });
 
+  app.get("/ping", (_req, res) => res.send("pong"));
 
   app.get("api/health", (_req, res) => {
     const uptimeSec = Math.floor((Date.now() - startTime) / 1000);

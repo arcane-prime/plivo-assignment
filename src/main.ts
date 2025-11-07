@@ -10,10 +10,13 @@ dotenv.config();
 
 const PORT = Number(process.env.PORT || 4000);
 const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || 30000);
+const MAX_BUFFER_SIZE = Number(process.env.MAX_WS_BUFFER_SIZE || 1024 * 1024); // 1MB default
+const MAX_PENDING_MESSAGES = Number(process.env.MAX_PENDING_MESSAGES || 100);
 
 type WsExt = WebSocket & {
   isAlive?: boolean;
   unsubscribers?: Map<string, () => Promise<void>>;
+  pendingMessages?: number;
 };
 
 async function start() {
@@ -23,10 +26,49 @@ async function start() {
   
   setWebSocketServer(wss);
 
+  function safeSend(ws: WsExt, data: string): boolean {
+    if (ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    const bufferedAmount = ws.bufferedAmount || 0;
+    const pendingMessages = ws.pendingMessages || 0;
+
+    if (bufferedAmount >= MAX_BUFFER_SIZE) {
+      console.warn(`WebSocket buffer full (${bufferedAmount} bytes), dropping message`);
+      return false;
+    }
+
+    if (pendingMessages >= MAX_PENDING_MESSAGES) {
+      console.warn(`Too many pending messages (${pendingMessages}), dropping message`);
+      return false;
+    }
+
+    try {
+      ws.pendingMessages = (ws.pendingMessages || 0) + 1;
+      ws.send(data, (err) => {
+        if (ws.pendingMessages) {
+          ws.pendingMessages = Math.max(0, ws.pendingMessages - 1);
+        }
+        if (err) {
+          console.error("WebSocket send error", err);
+        }
+      });
+      return true;
+    } catch (err) {
+      if (ws.pendingMessages) {
+        ws.pendingMessages = Math.max(0, ws.pendingMessages - 1);
+      }
+      console.error("WebSocket send exception", err);
+      return false;
+    }
+  }
+
   wss.on("connection", (rawWs) => {
     const ws = rawWs as WsExt;
     ws.isAlive = true;
     ws.unsubscribers = new Map();
+    ws.pendingMessages = 0;
 
     ws.on("pong", () => {
       ws.isAlive = true;
@@ -36,39 +78,56 @@ async function start() {
       try {
         const msg = JSON.parse(raw.toString());
         const { type, topic, client_id, last_n, request_id, message } = msg;
-        if (!type || !topic) return;
+        if (!type) return;
+
+        if (type === "ping") {
+          safeSend(ws, JSON.stringify({
+            type: "pong",
+            request_id: request_id || undefined,
+            ts: new Date().toISOString()
+          }));
+          return;
+        }
+
+        if (!topic) return;
 
         if (type === "subscribe") {
           if (!client_id) return;
           if (!topicExists(topic)) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "error",
-                topic,
-                client_id,
-                request_id,
-                error: "TOPIC_NOT_FOUND"
-              }));
-            }
+            safeSend(ws, JSON.stringify({
+              type: "error",
+              topic,
+              request_id: request_id || undefined,
+              error: {
+                code: "TOPIC_NOT_FOUND",
+                message: "Topic not found"
+              },
+              ts: new Date().toISOString()
+            }));
             return;
           }
           const subscriptionKey = `${topic}:${client_id}`;
           if (ws.unsubscribers!.has(subscriptionKey)) return;
 
           const handler = (payload: any) => {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ 
-                type: "message",
-                topic,
-                client_id,
-                request_id,
-                payload 
-              }));
-            }
+            safeSend(ws, JSON.stringify({ 
+              type: "event",
+              topic,
+              request_id: request_id || undefined,
+              message: payload,
+              ts: new Date().toISOString()
+            }));
           };
           const unsubscribe = await pubsub.subscribe(topic, handler);
           ws.unsubscribers!.set(subscriptionKey, unsubscribe);
           registerSubscription(topic, subscriptionKey);
+
+          safeSend(ws, JSON.stringify({
+            type: "ack",
+            topic,
+            request_id: request_id || undefined,
+            ts: new Date().toISOString()
+          }));
 
           if (last_n && last_n > 0 && client_id) {
             try {
@@ -80,15 +139,15 @@ async function start() {
                 return timeB - timeA;
               });
               const lastNEvents = sortedEvents.slice(0, last_n);
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ 
-                  type: "last_n",
-                  topic,
-                  client_id,
-                  request_id,
-                  events: lastNEvents 
-                }));
-              }
+              safeSend(ws, JSON.stringify({ 
+                type: "info",
+                topic,
+                request_id: request_id || undefined,
+                message: {
+                  events: lastNEvents
+                },
+                ts: new Date().toISOString()
+              }));
             } catch (err) {
               console.error("Error fetching last events for WebSocket", err);
             }
@@ -96,15 +155,16 @@ async function start() {
         } else if (type === "unsubscribe") {
           if (!client_id) return;
           if (!topicExists(topic)) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "error",
-                topic,
-                client_id,
-                request_id,
-                error: "TOPIC_NOT_FOUND"
-              }));
-            }
+            safeSend(ws, JSON.stringify({
+              type: "error",
+              topic,
+              request_id: request_id || undefined,
+              error: {
+                code: "TOPIC_NOT_FOUND",
+                message: "Topic not found"
+              },
+              ts: new Date().toISOString()
+            }));
             return;
           }
           const subscriptionKey = `${topic}:${client_id}`;
@@ -113,57 +173,60 @@ async function start() {
             await unsub();
             ws.unsubscribers!.delete(subscriptionKey);
             unregisterSubscription(topic, subscriptionKey);
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "unsubscribed",
-                topic,
-                client_id,
-                request_id
-              }));
-            }
+            safeSend(ws, JSON.stringify({
+              type: "ack",
+              topic,
+              request_id: request_id || undefined,
+              ts: new Date().toISOString()
+            }));
           }
         } else if (type === "publish") {
           if (!message) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "error",
-                topic,
-                request_id,
-                error: "Missing message field"
-              }));
-            }
+            safeSend(ws, JSON.stringify({
+              type: "error",
+              topic,
+              request_id: request_id || undefined,
+              error: {
+                code: "BAD_REQUEST",
+                message: "Missing message field"
+              },
+              ts: new Date().toISOString()
+            }));
             return;
           }
           if (!topicExists(topic)) {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "error",
-                topic,
-                request_id,
-                error: "TOPIC_NOT_FOUND"
-              }));
-            }
+            safeSend(ws, JSON.stringify({
+              type: "error",
+              topic,
+              request_id: request_id || undefined,
+              error: {
+                code: "TOPIC_NOT_FOUND",
+                message: "Topic not found"
+              },
+              ts: new Date().toISOString()
+            }));
             return;
           }
           try {
             await pubsub.publish(topic, message);
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "published",
-                topic,
-                request_id
-              }));
-            }
+            safeSend(ws, JSON.stringify({
+              type: "ack",
+              topic,
+              request_id: request_id || undefined,
+              ts: new Date().toISOString()
+            }));
           } catch (err) {
             console.error("Error publishing message", err);
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "error",
-                topic,
-                request_id,
-                error: "Failed to publish message"
-              }));
-            }
+            safeSend(ws, JSON.stringify({
+              type: "error",
+              topic,
+              request_id: request_id || undefined,
+              error: {
+                code: "INTERNAL_ERROR",
+                message: "Failed to publish message"
+              },
+              ts: new Date().toISOString()
+            }));
           }
         }
       } catch (err) {
