@@ -2,8 +2,10 @@ import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 import { getMetrics, getLastEvents } from "./metrics";
-import { createTopic, deleteTopic, topicExists } from "./topics";
-import { unsubscribeAllFromTopic, getAllTopicsWithSubscribers } from "./subscribers";
+import { createTopic, deleteTopic, topicExists, getAllTopics } from "./topics";
+import { unsubscribeAllFromTopic, getAllTopicsWithSubscribers, getTotalSubscriberCount } from "./subscribers";
+
+const startTime = Date.now();
 
 export async function createApp() {
   const app = express();
@@ -59,29 +61,17 @@ export async function createApp() {
     }
   });
 
-  app.get("/api/metrics/:clientId", async (req, res) => {
-    const clientId = req.params.clientId;
-    try {
-      const data = await getMetrics(clientId);
-      res.json(data);
-    } catch (err) {
-      console.error("Error fetching metrics", { clientId, error: err });
-      res.status(500).json({ error: "internal error" });
-    }
-  });
 
-  app.get("/api/last/:clientId", async (req, res) => {
-    const clientId = req.params.clientId;
-    try {
-      const data = await getLastEvents(clientId);
-      res.json(data);
-    } catch (err) {
-      console.error("Error fetching last events", { clientId, error: err });
-      res.status(500).json({ error: "internal error" });
-    }
+  app.get("api/health", (_req, res) => {
+    const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
+    const topicsCount = getAllTopics().length;
+    const subscribersCount = getTotalSubscriberCount();
+    return res.json({
+      uptime_sec: uptimeSec,
+      topics: topicsCount,
+      subscribers: subscribersCount
+    });
   });
-
-  app.get("/ping", (_req, res) => res.send("pong"));
 
   return app;
 }

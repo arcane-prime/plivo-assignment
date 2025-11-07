@@ -63,6 +63,14 @@ export async function unsubscribeAllFromTopic(topic: string): Promise<void> {
   topicSubscriptions.delete(topic);
 }
 
+export function getTotalSubscriberCount(): number {
+  let total = 0;
+  for (const subs of topicSubscriptions.values()) {
+    total += subs.size;
+  }
+  return total;
+}
+
 export function getAllTopicsWithSubscribers(): Array<{ name: string; subscribers: number }> {
   const allTopicNames = getAllTopics();
   return allTopicNames.map(topic => ({
